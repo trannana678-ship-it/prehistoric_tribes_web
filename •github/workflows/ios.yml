@@ -1,0 +1,101 @@
+# Build an UNSIGNED iOS .ipa for Prehistoric Tribes (Tauri 2 + WKWebView).
+#
+# How the iOS scaffold gets here: the Muse GitHub App cannot write file
+# contents to this fork (403 on git trees / Contents API), so only this
+# workflow file is committed. The macOS runner generates
+# web/src-tauri/gen/apple/ itself with the official Tauri CLI
+# (`tauri ios init`) before building. No game code is changed; the web
+# frontend (web/dist) is built the same way as for Windows/Android.
+#
+# The app is built UNSIGNED (CODE_SIGNING_ALLOWED=NO) and packaged by hand
+# into Payload/<app>.app -> PrehistoricTribes-unsigned.ipa, for sideloading
+# via AltStore / SideStore. No Apple Developer account is needed.
+name: iOS (unsigned IPA)
+
+on:
+  push:
+    branches: [ios, main]
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Set up Rust stable + iOS target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build web frontend
+        run: npm run build --workspace=web
+
+      # Generate the iOS Xcode project with the official Tauri CLI.
+      # (The CLI's `ios` subcommand is macOS-only, so this cannot run on
+      # Linux; the runner is macOS so it works here.) The scaffold is
+      # generated from web/src-tauri/tauri.conf.json (productName
+      # "Prehistoric Tribes", identifier com.prehistorictribes.game).
+      # Fails fast (5 min) instead of hanging if the command ever prompts.
+      - name: Generate iOS scaffold (tauri ios init)
+        working-directory: web
+        timeout-minutes: 5
+        run: ../node_modules/.bin/tauri ios init
+
+      # The generated AppIcon set ships with placeholder icons. Replace
+      # them with the game's own icons, byte-identical copies of the
+      # tracked web/src-tauri/icons/ios/*.png.
+      - name: Populate app icons from tracked sources
+        run: |
+          APPICON="$(find web/src-tauri/gen/apple -type d -name 'AppIcon.appiconset' | head -n 1)"
+          test -n "$APPICON" || { echo "::error::AppIcon.appiconset not found under web/src-tauri/gen/apple"; find web/src-tauri/gen/apple -maxdepth 3 | head -50; exit 1; }
+          rm -f "$APPICON"/*.png
+          cp web/src-tauri/icons/ios/*.png "$APPICON"/
+          test "$(ls "$APPICON"/*.png | wc -l)" -eq 18
+
+      # NOTE: dtolnay/rust-toolchain already puts cargo on PATH for all
+      # later steps, so the "Build Rust Code" script phase inside Xcode
+      # (which runs `cargo build` via `tauri ios xcode-script`) finds it.
+      - name: Build iOS app (unsigned)
+        working-directory: web/src-tauri/gen/apple
+        run: |
+          PROJ="$(find . -maxdepth 1 -name '*.xcodeproj' | head -n 1)"
+          test -n "$PROJ" || { echo "::error::no .xcodeproj found"; ls -la; exit 1; }
+          SCHEME="$(xcodebuild -list -project "$PROJ" 2>/dev/null | awk '/Schemes:/{f=1;next} f && NF {print $1; exit}')"
+          test -n "$SCHEME" || { echo "::error::no scheme found in $PROJ"; xcodebuild -list -project "$PROJ"; exit 1; }
+          echo "Building $PROJ scheme $SCHEME"
+          xcodebuild -project "$PROJ" \
+            -scheme "$SCHEME" \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          APP="web/src-tauri/gen/apple/build/Build/Products/Release-iphoneos/Prehistoric Tribes.app"
+          test -d "$APP" || { echo "::error::.app not found at $APP"; ls -R web/src-tauri/gen/apple/build/Build/Products/ || true; exit 1; }
+          rm -rf Payload PrehistoricTribes-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -r -y PrehistoricTribes-unsigned.ipa Payload
+          rm -rf Payload
+          ls -lh PrehistoricTribes-unsigned.ipa
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: prehistoric-tribes-ios-unsigned
+          path: PrehistoricTribes-unsigned.ipa

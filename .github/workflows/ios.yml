@@ -1,0 +1,135 @@
+# Build an UNSIGNED iOS .ipa for Prehistoric Tribes (Tauri 2 + WKWebView).
+#
+# How the iOS scaffold gets here: the Muse GitHub App cannot write file
+# contents to this fork (403 on git trees / Contents API), so only this
+# workflow file is committed. The macOS runner generates
+# web/src-tauri/gen/apple/ itself with the official Tauri CLI
+# (`tauri ios init`) before building. No game code is changed; the web
+# frontend (web/dist) is built the same way as for Windows/Android.
+#
+# The app is built UNSIGNED (CODE_SIGNING_ALLOWED=NO) and packaged by hand
+# into Payload/<app>.app -> PrehistoricTribes-unsigned.ipa, for sideloading
+# via AltStore / SideStore. No Apple Developer account is needed.
+#
+# Two run-#5 lessons baked in below (2026-11-17, verified against the
+# Tauri CLI 2.12.4 source and the run-#5 log):
+#  1. `tauri ios init` bakes HOW the CLI was invoked into the Xcode
+#     "Build Rust Code" script. Invoking the binary directly
+#     (`../node_modules/.bin/tauri ios init`) makes it generate
+#     `<node> tauri ios xcode-script ...`, which fails at build time
+#     because no file named `tauri` exists in gen/apple
+#     ("Cannot find module '.../gen/apple/tauri'", exit code 65).
+#     Going through `npm run` makes it generate
+#     `npm run -- tauri ios xcode-script ...` instead, which resolves
+#     via node_modules/.bin. So init MUST run via `npm run tauri`.
+#  2. `xcodebuild -scheme ... -configuration Release` still builds
+#     Debug: with `-scheme`, Xcode uses the scheme's LaunchAction
+#     configuration (Debug in the generated .xcscheme) and ignores
+#     `-configuration`. So the scheme is patched to Release before
+#     building; the .app then lands in Release-iphoneos/ as expected.
+name: iOS (unsigned IPA)
+
+on:
+  push:
+    branches: [ios, main]
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Set up Rust stable + iOS target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build web frontend
+        run: npm run build --workspace=web
+
+      # Generate the iOS Xcode project with the official Tauri CLI.
+      # (The CLI's `ios` subcommand is macOS-only, so this cannot run on
+      # Linux; the runner is macOS so it works here.) The scaffold is
+      # generated from web/src-tauri/tauri.conf.json (productName
+      # "Prehistoric Tribes", identifier com.prehistorictribes.game).
+      # Fails fast (5 min) instead of hanging if the command ever prompts.
+      # MUST run via `npm run tauri` (not the binary directly): see the
+      # header comment — the CLI bakes the invocation into the Xcode
+      # "Build Rust Code" script, and a direct binary call generates a
+      # broken script (run #5: "Cannot find module .../gen/apple/tauri").
+      - name: Generate iOS scaffold (tauri ios init)
+        working-directory: web
+        timeout-minutes: 5
+        run: npm run tauri ios init
+
+      # The generated AppIcon set ships with placeholder icons. Replace
+      # them with the game's own icons, byte-identical copies of the
+      # tracked web/src-tauri/icons/ios/*.png.
+      - name: Populate app icons from tracked sources
+        run: |
+          APPICON="$(find web/src-tauri/gen/apple -type d -name 'AppIcon.appiconset' | head -n 1)"
+          test -n "$APPICON" || { echo "::error::AppIcon.appiconset not found under web/src-tauri/gen/apple"; find web/src-tauri/gen/apple -maxdepth 3 | head -50; exit 1; }
+          rm -f "$APPICON"/*.png
+          cp web/src-tauri/icons/ios/*.png "$APPICON"/
+          test "$(ls "$APPICON"/*.png | wc -l)" -eq 18
+
+      # The generated .xcscheme builds Debug (LaunchAction/TestAction/
+      # AnalyzeAction are Debug; only Archive/Profile are Release), and
+      # `xcodebuild -scheme` ignores `-configuration Release` (run #5
+      # built debug-iphoneos despite `-configuration Release`). Flip the
+      # scheme to Release so the .app lands in Release-iphoneos/.
+      - name: Set scheme build configuration to Release
+        run: |
+          SCHEME_FILE="$(find web/src-tauri/gen/apple -name '*.xcscheme' | head -n 1)"
+          test -n "$SCHEME_FILE" || { echo "::error::no .xcscheme found"; find web/src-tauri/gen/apple -maxdepth 4 | head -50; exit 1; }
+          sed -i '' 's/buildConfiguration = "Debug"/buildConfiguration = "Release"/g' "$SCHEME_FILE"
+          test "$(grep -c 'buildConfiguration = "Debug"' "$SCHEME_FILE")" -eq 0
+
+      # NOTE: dtolnay/rust-toolchain already puts cargo on PATH for all
+      # later steps, so the "Build Rust Code" script phase inside Xcode
+      # (which runs `tauri ios xcode-script`) finds it.
+      - name: Build iOS app (unsigned)
+        working-directory: web/src-tauri/gen/apple
+        run: |
+          PROJ="$(find . -maxdepth 1 -name '*.xcodeproj' | head -n 1)"
+          test -n "$PROJ" || { echo "::error::no .xcodeproj found"; ls -la; exit 1; }
+          SCHEME="$(xcodebuild -list -project "$PROJ" 2>/dev/null | awk '/Schemes:/{f=1;next} f && NF {print $1; exit}')"
+          test -n "$SCHEME" || { echo "::error::no scheme found in $PROJ"; xcodebuild -list -project "$PROJ"; exit 1; }
+          echo "Building $PROJ scheme $SCHEME"
+          xcodebuild -project "$PROJ" \
+            -scheme "$SCHEME" \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          APP="$(find web/src-tauri/gen/apple/build/Build/Products -maxdepth 2 -name 'Prehistoric Tribes.app' -type d | head -n 1)"
+          test -d "$APP" || { echo "::error::.app not found under build/Build/Products"; ls -R web/src-tauri/gen/apple/build/Build/Products/ || true; exit 1; }
+          echo "Packaging $APP"
+          rm -rf Payload PrehistoricTribes-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -r -y PrehistoricTribes-unsigned.ipa Payload
+          rm -rf Payload
+          ls -lh PrehistoricTribes-unsigned.ipa
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: prehistoric-tribes-ios-unsigned
+          path: PrehistoricTribes-unsigned.ipa

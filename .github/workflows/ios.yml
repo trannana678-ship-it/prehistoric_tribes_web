@@ -1,0 +1,124 @@
+# Build an UNSIGNED iOS .ipa for Prehistoric Tribes (Tauri 2 + WKWebView).
+#
+# How the iOS scaffold gets here: the Muse GitHub App cannot write file
+# contents to this fork (403 on git trees / Contents API), so only this
+# workflow file is committed. The macOS runner generates
+# web/src-tauri/gen/apple/ itself with the official Tauri CLI
+# (`tauri ios init`) before building. No game code is changed; the web
+# frontend (web/dist) is built the same way as for Windows/Android.
+#
+# The app is built UNSIGNED and packaged into PrehistoricTribes-unsigned.ipa,
+# for sideloading via AltStore / SideStore. No Apple Developer account is
+# needed. The Tauri CLI itself produces the unsigned IPA
+# (`tauri ios build --no-sign`); the workflow only renames it for the artifact.
+#
+# Lessons baked in below (verified against the Tauri CLI 2.12.4 source and
+# the run logs):
+#  - run #5: `tauri ios init` bakes HOW the CLI was invoked into the Xcode
+#    "Build Rust Code" script. Invoking the binary directly
+#    (`../node_modules/.bin/tauri ios init`) makes it generate
+#    `<node> tauri ios xcode-script ...`, which fails at build time
+#    because no file named `tauri` exists in gen/apple
+#    ("Cannot find module '.../gen/apple/tauri'", exit code 65).
+#    Going through `npm run` makes it generate
+#    `npm run -- tauri ios xcode-script ...` instead, which resolves
+#    via node_modules/.bin. So init MUST run via `npm run tauri`.
+#  - run #6: NEVER call raw `xcodebuild` on the generated project. The
+#    Xcode "Build Rust Code" script phase runs `tauri ios xcode-script`,
+#    which reads its options from gen/apple/.tauri/cli-options-server.json
+#    — a file served by a live `tauri ios build` (or `dev`) process.
+#    With raw xcodebuild that file is missing and the script phase dies
+#    immediately ("failed to read .../cli-options-server.json").
+#    So the build step runs `tauri ios build --no-sign --ci`, which starts
+#    the options server, archives in Release, and zips the unsigned .app
+#    from the .xcarchive into an IPA itself. (The run-#6 scheme patch to
+#    force Release was also dropped: it never took effect for raw
+#    xcodebuild, and the CLI archives Release on its own.)
+name: iOS (unsigned IPA)
+
+on:
+  push:
+    branches: [ios, main]
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Set up Rust stable + iOS target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build web frontend
+        run: npm run build --workspace=web
+
+      # Generate the iOS Xcode project with the official Tauri CLI.
+      # (The CLI's `ios` subcommand is macOS-only, so this cannot run on
+      # Linux; the runner is macOS so it works here.) The scaffold is
+      # generated from web/src-tauri/tauri.conf.json (productName
+      # "Prehistoric Tribes", identifier com.prehistorictribes.game).
+      # Fails fast (5 min) instead of hanging if the command ever prompts.
+      # MUST run via `npm run tauri` (not the binary directly): see the
+      # header comment — the CLI bakes the invocation into the Xcode
+      # "Build Rust Code" script, and a direct binary call generates a
+      # broken script (run #5: "Cannot find module .../gen/apple/tauri").
+      - name: Generate iOS scaffold (tauri ios init)
+        working-directory: web
+        timeout-minutes: 5
+        run: npm run tauri ios init
+
+      # The generated AppIcon set ships with placeholder icons. Replace
+      # them with the game's own icons, byte-identical copies of the
+      # tracked web/src-tauri/icons/ios/*.png.
+      - name: Populate app icons from tracked sources
+        run: |
+          APPICON="$(find web/src-tauri/gen/apple -type d -name 'AppIcon.appiconset' | head -n 1)"
+          test -n "$APPICON" || { echo "::error::AppIcon.appiconset not found under web/src-tauri/gen/apple"; find web/src-tauri/gen/apple -maxdepth 3 | head -50; exit 1; }
+          rm -f "$APPICON"/*.png
+          cp web/src-tauri/icons/ios/*.png "$APPICON"/
+          test "$(ls "$APPICON"/*.png | wc -l)" -eq 18
+
+      # Build the iOS app with the Tauri CLI itself (NOT raw xcodebuild):
+      # the Xcode "Build Rust Code" script phase runs `tauri ios xcode-script`,
+      # which needs the options server that only a live `tauri ios build`
+      # (or `dev`) process provides — raw xcodebuild dies immediately
+      # (run #6: "failed to read .../cli-options-server.json").
+      # `tauri ios build` archives in Release and, with --no-sign, zips the
+      # unsigned .app from the .xcarchive into an IPA itself (no Apple ID,
+      # keychain or provisioning profile needed). --ci keeps it non-interactive.
+      # NOTE: dtolnay/rust-toolchain already puts cargo on PATH for all
+      # later steps, so the "Build Rust Code" script phase finds it.
+      - name: Build iOS app (unsigned)
+        working-directory: web
+        timeout-minutes: 20
+        run: npm run tauri ios build -- --no-sign --ci
+
+      # The CLI already produced the unsigned IPA (a Payload zip of the
+      # unsigned .app). Find it under gen/apple and rename it for the artifact.
+      - name: Package unsigned IPA
+        run: |
+          IPA="$(find web/src-tauri/gen/apple -name '*.ipa' | head -n 1)"
+          test -f "$IPA" || { echo "::error::no .ipa found under web/src-tauri/gen/apple"; find web/src-tauri/gen/apple/build -maxdepth 4 2>/dev/null | head -50 || true; exit 1; }
+          echo "Found IPA: $IPA"
+          rm -f PrehistoricTribes-unsigned.ipa
+          cp "$IPA" PrehistoricTribes-unsigned.ipa
+          ls -lh PrehistoricTribes-unsigned.ipa
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: prehistoric-tribes-ios-unsigned
+          path: PrehistoricTribes-unsigned.ipa
